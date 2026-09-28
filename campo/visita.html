@@ -37,13 +37,26 @@
       });
     });
   }
+  /* El aviso tapa la parte de arriba de la pantalla (el visor de fotos, por ejemplo): la X lo cierra hasta que se
+     vuelva a abrir la app. El guardián sigue trabajando por debajo y pasa al dominio nuevo cuando no quede nada. */
+  var CERRADO = 'psismo.avisoDominioCerrado';
+  function cerrado() { try { return sessionStorage.getItem(CERRADO) === '1'; } catch (e) { return false; } }
   function aviso(n) {
+    if (cerrado()) return;
     var b = document.createElement('div');
     b.id = 'avisoDominio';
-    b.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:99999;background:#fac400;color:#0f2447;font:600 13px/1.4 system-ui,sans-serif;padding:10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.2)');
-    b.innerHTML = n > 0
+    b.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:99999;background:#fac400;color:#0f2447;font:600 13px/1.4 system-ui,sans-serif;padding:10px 48px 10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.2)');
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Cerrar aviso');
+    x.textContent = '×';
+    x.setAttribute('style', 'position:absolute;top:50%;right:6px;transform:translateY(-50%);width:36px;height:36px;border:0;border-radius:50%;background:rgba(15,36,71,.12);color:#0f2447;font:700 22px/36px system-ui,sans-serif;padding:0;cursor:pointer');
+    x.addEventListener('click', function () { try { sessionStorage.setItem(CERRADO, '1'); } catch (e) {} b.remove(); });
+    var t = document.createElement('div');
+    t.innerHTML = n > 0
       ? 'La app cambió de dirección. Este teléfono tiene ' + n + ' visita' + (n === 1 ? '' : 's') + ' sin enviar: envíela' + (n === 1 ? '' : 's') + ' desde aquí. Cuando no quede ninguna, pasará sola a la dirección nueva.'
       : 'La app cambió de dirección. No se pudo revisar si hay visitas sin enviar: envíe lo pendiente y luego <a style="color:#0f2447" href="' + destino + '">abra la dirección nueva</a>.';
+    b.appendChild(t); b.appendChild(x);
     (document.body || document.documentElement).appendChild(b);
   }
   cuenta().then(function (n) {
