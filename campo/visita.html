@@ -1,77 +1,219 @@
 <!doctype html>
 <html lang="es" data-theme="light">
 <head><script>
-/* Guardián del dominio viejo: solo se queda aquí quien tenga visitas sin enviar en este teléfono. */
+/* Guardián del dominio viejo (v2, 29-sep-2026).
+
+   Lo que un teléfono guardó sin enviar vive en el almacenamiento de ESTE dominio, y el nuevo no puede leerlo. La v1
+   se quedaba aquí con un aviso amarillo mientras hubiera algo «sin enviar», y contaba como tal cualquier visita no
+   enviada, también las vacías de «Nueva visita»: casi nadie salía nunca. La v2 se lleva el trabajo en vez de
+   esperar a que se acabe:
+
+     1. Pendiente es solo lo que tiene contenido: una visita terminada («lista») o una pasada del primer paso.
+     2. Sin nada pendiente, directo al dominio nuevo.
+     3. Con pendientes y con señal: primero se deja a la app enviar las terminadas, como hace siempre (hasta un
+        minuto). Lo que quede se sube como borrador a campo-borrador —respuestas y cada fotografía, como la copia de
+        respaldo que la app ya hace— y se pasa al dominio nuevo. Allí sale «Hay trabajo guardado en el servidor» y
+        cada visita vuelve con «Traer», fotos incluidas.
+     4. Sin señal, o si algo no sube: la app funciona aquí como siempre, sin aviso, y se reintenta al volver a abrir.
+     5. Una visita con documentos (PDF) no cabe en un borrador: esa se envía desde aquí, y solo entonces sale una nota.
+
+   Nada se borra de este teléfono: lo subido queda anotado (psismo.migradoAlNuevo, con la hora de su último cambio)
+   para no volver a subirlo, y si la visita cambiara después se subiría otra vez. */
 (function () {
   var NUEVO = 'https://manizalesconstruye.camacolcaldas.com';
-  var destino = NUEVO + location.pathname + location.search + location.hash;
+  var API = 'https://ymbzpuxyvquvawfdntly.supabase.co/functions/v1/campo-borrador';
+  var LS_MIGRADO = 'psismo.migradoAlNuevo';
+  var ESPERA_LISTAS = 60000;
   window.__DOMINIO_VIEJO__ = true;
-  function sinEnviar(lista) { return lista.filter(function (v) { return v && v.estado && v.estado !== 'enviada'; }).length; }
-  function desdeRespaldo() { try { var t = JSON.parse(localStorage.getItem('psismo.visitas') || '{}'); return sinEnviar(Object.keys(t).map(function (k) { return t[k]; })); } catch (e) { return 0; } }
-  /* Devuelve cuántas visitas sin enviar hay; -1 si no se pudo saber (entonces la app se queda aquí, por prudencia).
-     No se abre la base si no existe: abrirla la crearía vacía y la app arrancaría sin sus almacenes. */
-  function existeBase() {
-    if (!indexedDB.databases) return Promise.resolve(null);   /* navegador sin la lista: no se sabe */
-    return indexedDB.databases().then(function (l) { return l.some(function (x) { return x.name === 'psismo'; }); }).catch(function () { return null; });
+
+  /* La dirección con la que se abrió, tomada ya: al arrancar, la app limpia la barra (replaceState) y el ancla y los
+     parámetros se perderían antes de irse. */
+  var RUTA = location.pathname, BUSQUEDA = location.search, ANCLA = location.hash;
+  function token() { try { return localStorage.getItem('psismo.token') || ''; } catch (e) { return ''; } }
+  function tokenDelEnlace() { try { return new URLSearchParams(BUSQUEDA).get('e') || ''; } catch (e) { return ''; } }
+  /* El enlace personal lleva ?e=<token>. Quien abre desde el icono no lo trae: se le pone el que el teléfono guardó,
+     para que en el dominio nuevo no tenga que volver a pedir su enlace. */
+  function destino() {
+    var q = BUSQUEDA, t = token();
+    if (t && !tokenDelEnlace()) q = (q ? q + '&' : '?') + 'e=' + encodeURIComponent(t);
+    return NUEVO + RUTA + q + ANCLA;
   }
-  function cuenta() {
-    var n0 = desdeRespaldo();
-    if (!window.indexedDB) return Promise.resolve(n0);
-    return existeBase().then(function (hay) {
-      if (hay === false) return n0;
-      if (hay === null) return n0 > 0 ? n0 : -1;
-      return new Promise(function (ok) {
-        var listo = false, reloj = setTimeout(function () { if (!listo) { listo = true; ok(n0 || -1); } }, 8000), s;
-        try { s = indexedDB.open('psismo'); } catch (e) { clearTimeout(reloj); return ok(n0 || -1); }
-        s.onerror = function () { if (!listo) { listo = true; clearTimeout(reloj); ok(n0 || -1); } };
-        s.onsuccess = function () {
-          var d = s.result;
-          var fin = function (n) { if (listo) return; listo = true; clearTimeout(reloj); try { d.close(); } catch (e) {} ok(n < 0 ? -1 : n + n0); };
-          if (!d.objectStoreNames.contains('visitas')) return fin(0);
-          try {
-            var r = d.transaction('visitas', 'readonly').objectStore('visitas').getAll();
-            r.onsuccess = function () { fin(sinEnviar(r.result || [])); };
-            r.onerror = function () { fin(-1); };
-          } catch (e) { fin(-1); }
-        };
-      });
+  function vete() { location.replace(destino()); }
+  function leeJSON(k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } }
+  function migrado() { return leeJSON(LS_MIGRADO) || {}; }
+  function anotaMigrado(v) { var m = migrado(); m[v.id] = v.tocada || 0; try { localStorage.setItem(LS_MIGRADO, JSON.stringify(m)); } catch (e) {} }
+
+  function esFoto(x) { return typeof x === 'string' && /^data:image\/(jpeg|png|webp);base64,/i.test(x); }
+  function esAdjunto(x) {
+    if (!Array.isArray(x) || !x.length) return false;
+    return x.some(function (y) { return (typeof y === 'string' && y.slice(0, 5) === 'data:') || (y && typeof y === 'object' && typeof y.datos === 'string'); });
+  }
+  function tieneDocumentos(v) {
+    var D = v.D || {};
+    return Object.keys(D).some(function (k) {
+      return Array.isArray(D[k]) && D[k].some(function (y) { return (y && typeof y === 'object' && typeof y.datos === 'string') || (typeof y === 'string' && y.slice(0, 5) === 'data:' && !esFoto(y)); });
     });
   }
-  /* El aviso tapa la parte de arriba de la pantalla (el visor de fotos, por ejemplo): la X lo cierra hasta que se
-     vuelva a abrir la app. El guardián sigue trabajando por debajo y pasa al dominio nuevo cuando no quede nada. */
-  var CERRADO = 'psismo.avisoDominioCerrado';
-  function cerrado() { try { return sessionStorage.getItem(CERRADO) === '1'; } catch (e) { return false; } }
-  function aviso(n) {
-    if (cerrado()) return;
-    var b = document.createElement('div');
-    b.id = 'avisoDominio';
-    b.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:99999;background:#fac400;color:#0f2447;font:600 13px/1.4 system-ui,sans-serif;padding:10px 48px 10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.2)');
-    var x = document.createElement('button');
-    x.type = 'button';
-    x.setAttribute('aria-label', 'Cerrar aviso');
-    x.textContent = '×';
-    x.setAttribute('style', 'position:absolute;top:50%;right:6px;transform:translateY(-50%);width:36px;height:36px;border:0;border-radius:50%;background:rgba(15,36,71,.12);color:#0f2447;font:700 22px/36px system-ui,sans-serif;padding:0;cursor:pointer');
-    x.addEventListener('click', function () { try { sessionStorage.setItem(CERRADO, '1'); } catch (e) {} b.remove(); });
-    var t = document.createElement('div');
-    t.innerHTML = n > 0
-      ? 'La app cambió de dirección. Este teléfono tiene ' + n + ' visita' + (n === 1 ? '' : 's') + ' sin enviar: envíela' + (n === 1 ? '' : 's') + ' desde aquí. Cuando no quede ninguna, pasará sola a la dirección nueva.'
-      : 'La app cambió de dirección. No se pudo revisar si hay visitas sin enviar: envíe lo pendiente y luego <a style="color:#0f2447" href="' + destino + '">abra la dirección nueva</a>.';
-    b.appendChild(t); b.appendChild(x);
-    (document.body || document.documentElement).appendChild(b);
+  function pendiente(v) { return !!(v && v.id && v.estado !== 'enviada' && (v.estado === 'lista' || (v.paso || 0) > 0)); }
+  function porSubir(v) { return pendiente(v) && migrado()[v.id] !== (v.tocada || 0); }
+
+  /* Las visitas de este teléfono: IndexedDB (con fotos) y el respaldo de localStorage (sin fotos), sin crear la base
+     si no existe. Si la base no abre, la app también trabaja con el respaldo, así que eso es lo que hay. */
+  function leeIDB() {
+    return new Promise(function (ok) {
+      if (!window.indexedDB) return ok([]);
+      var listo = false, s, nueva = false;
+      var reloj = setTimeout(function () { fin(null); }, 8000);
+      function fin(l) { if (listo) return; listo = true; clearTimeout(reloj); ok(l); }
+      try { s = indexedDB.open('psismo'); } catch (e) { return fin(null); }
+      s.onupgradeneeded = function (ev) { if (ev.oldVersion === 0) { nueva = true; try { s.transaction.abort(); } catch (e) {} } };
+      s.onerror = function (ev) { try { ev.preventDefault(); } catch (e) {} fin(nueva ? [] : null); };
+      s.onblocked = function () { fin(null); };
+      s.onsuccess = function () {
+        var d = s.result;
+        /* Que la app pueda abrir o actualizar la base aunque esta lectura siga en curso. */
+        d.onversionchange = function () { try { d.close(); } catch (e) {} };
+        if (!d.objectStoreNames.contains('visitas')) { try { d.close(); } catch (e) {} return fin([]); }
+        try {
+          var r = d.transaction('visitas', 'readonly').objectStore('visitas').getAll();
+          r.onsuccess = function () { try { d.close(); } catch (e) {} fin(r.result || []); };
+          r.onerror = function () { try { d.close(); } catch (e) {} fin(null); };
+        } catch (e) { try { d.close(); } catch (x) {} fin(null); }
+      };
+    });
   }
-  cuenta().then(function (n) {
-    if (n === 0) { location.replace(destino); return; }
-    var pinta = function () { if (!document.getElementById('avisoDominio')) aviso(n); };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', pinta); else pinta();
-    /* cada 20 s: si ya se envió todo, pasar al dominio nuevo */
-    setInterval(function () {
-      cuenta().then(function (m) {
-        if (m === 0) { location.replace(NUEVO + location.pathname + location.search + location.hash); return; }
-        var a = document.getElementById('avisoDominio'); if (a) a.remove(); aviso(m);
+  function visitas() {
+    return leeIDB().then(function (idb) {
+      var t = leeJSON('psismo.visitas') || {}, porId = {};
+      Object.keys(t).forEach(function (k) { if (t[k] && t[k].id) porId[t[k].id] = t[k]; });
+      (idb || []).forEach(function (v) { if (v && v.id) porId[v.id] = v; });   /* la de IndexedDB lleva las fotos */
+      return Object.keys(porId).map(function (k) { return porId[k]; });
+    });
+  }
+
+  function pide(cuerpo) {
+    var ctl = window.AbortController ? new AbortController() : null;
+    var reloj = ctl ? setTimeout(function () { ctl.abort(); }, 90000) : null;
+    return fetch(API, {
+      method: 'POST', signal: ctl ? ctl.signal : undefined,
+      headers: { 'Content-Type': 'application/json', 'x-token-evaluador': token() },
+      body: JSON.stringify(cuerpo)
+    }).then(function (r) { if (reloj) clearTimeout(reloj); if (!r.ok) throw new Error('http ' + r.status); return r.json(); });
+  }
+  function titulo(v) {
+    var r = v.resumen;
+    if (typeof r === 'string' && r) return r.slice(0, 200);
+    if (r && typeof r === 'object') return String(r.direccion || r.codigo || 'Visita sin dirección').slice(0, 200);
+    return 'Visita sin dirección';
+  }
+  function fotosDe(v) {
+    var D = v.D || {}, l = [];
+    Object.keys(D).forEach(function (k) {
+      if (!Array.isArray(D[k]) || !/^[\w-]+$/.test(k)) return;
+      D[k].forEach(function (x, i) { if (esFoto(x)) l.push({ campo: k, orden: i, datos: x }); });
+    });
+    return l;
+  }
+  /* Una visita al servidor: las respuestas y después cada foto. Si algo falla, no se da por subida. */
+  function sube(v, avance) {
+    var R = {};
+    Object.keys(v.D || {}).forEach(function (k) { if (k !== 'clave_dispositivo' && !esAdjunto(v.D[k])) R[k] = v.D[k]; });
+    var fotos = fotosDe(v);
+    return pide({ accion: 'guarda', visita: v.id, asignacion: v.asignacion || null, respuestas: R,
+                  paso: v.paso || 0, resumen: titulo(v), dispositivo: ('dominio viejo · ' + (navigator.userAgent || '')).slice(0, 80) })
+      .then(function () {
+        return fotos.reduce(function (cadena, f, i) {
+          return cadena.then(function () {
+            avance(i + 1, fotos.length);
+            return pide({ accion: 'foto', visita: v.id, campo: f.campo, orden: f.orden, datos: f.datos });
+          });
+        }, Promise.resolve());
+      })
+      .then(function () { anotaMigrado(v); return true; });
+  }
+
+  /* ---- lo que se ve: una capa mientras se sube, y la nota de los documentos */
+  var capa = null, parar = false;
+  function muestra(txt) {
+    if (!document.body) return;
+    if (!capa) {
+      capa = document.createElement('div');
+      capa.id = 'mudanza';
+      capa.setAttribute('style', 'position:fixed;inset:0;z-index:99999;background:rgba(15,36,71,.92);color:#fff;display:flex;align-items:center;justify-content:center;padding:24px;font:15px/1.5 system-ui,-apple-system,sans-serif;text-align:center');
+      capa.innerHTML = '<div style="max-width:340px"><div style="font-weight:700;font-size:17px;margin-bottom:8px">La app cambió de dirección</div>' +
+        '<div id="mudanzaTxt"></div><div style="font-size:12.5px;opacity:.8;margin-top:10px">No cierre la app. Su trabajo sigue guardado en este teléfono.</div>' +
+        '<button type="button" id="mudanzaNo" style="margin-top:18px;min-height:44px;padding:0 18px;border-radius:22px;border:1px solid rgba(255,255,255,.5);background:transparent;color:#fff;font:600 14px system-ui,sans-serif">Seguir aquí por ahora</button></div>';
+      document.body.appendChild(capa);
+      document.getElementById('mudanzaNo').onclick = function () { parar = true; quita(); };
+    }
+    document.getElementById('mudanzaTxt').textContent = txt;
+  }
+  function quita() { if (capa) { capa.remove(); capa = null; } }
+  function notaDocumentos(n) {
+    if (!document.body || document.getElementById('notaDominio')) return;
+    try { if (sessionStorage.getItem('psismo.notaDominioCerrada') === '1') return; } catch (e) {}
+    var b = document.createElement('div');
+    b.id = 'notaDominio';
+    b.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:99998;background:#0f2447;color:#fff;font:600 13px/1.4 system-ui,sans-serif;padding:10px 52px 10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.2)');
+    b.innerHTML = '<div>' + (n === 1 ? 'Una visita tiene documentos adjuntos' : n + ' visitas tienen documentos adjuntos') +
+      ' y se envía' + (n === 1 ? '' : 'n') + ' desde aquí. Cuando se envíe' + (n === 1 ? '' : 'n') + ', la app pasará sola a la dirección nueva.</div>' +
+      '<button type="button" aria-label="Cerrar" style="position:absolute;top:50%;right:6px;transform:translateY(-50%);width:40px;height:40px;border:0;border-radius:50%;background:rgba(255,255,255,.15);color:#fff;font:700 22px/40px system-ui,sans-serif;padding:0">×</button>';
+    b.querySelector('button').onclick = function () { try { sessionStorage.setItem('psismo.notaDominioCerrada', '1'); } catch (e) {} b.remove(); };
+    document.body.appendChild(b);
+  }
+  function cuandoHayCuerpo(fn) { if (document.body) fn(); else document.addEventListener('DOMContentLoaded', fn); }
+  function espera(ms) { return new Promise(function (ok) { setTimeout(ok, ms); }); }
+
+  /* Las terminadas las envía la app sola al arrancar con señal: se le da tiempo antes de subir nada. */
+  function esperaListas(ids, desde) {
+    return visitas().then(function (l) {
+      var quedan = l.filter(function (v) { return ids[v.id] && v.estado === 'lista'; }).length;
+      if (!quedan || parar || Date.now() - desde > ESPERA_LISTAS) return l;
+      muestra('Enviando ' + (quedan === 1 ? 'la visita terminada' : 'las ' + quedan + ' visitas terminadas') + '…');
+      return espera(4000).then(function () { return esperaListas(ids, desde); });
+    });
+  }
+
+  function mudanza() {
+    return visitas().then(function (l) {
+      var p = l.filter(porSubir);
+      if (!p.length) return vete();
+      if (!token() || navigator.onLine === false) return;        /* sin señal: se trabaja aquí, sin aviso */
+      var ids = {}; p.forEach(function (v) { ids[v.id] = true; });
+      return new Promise(function (ok) { cuandoHayCuerpo(ok); }).then(function () {
+        var hayListas = p.some(function (v) { return v.estado === 'lista'; });
+        muestra('Revisando las visitas de este teléfono…');
+        return (hayListas ? esperaListas(ids, Date.now()) : Promise.resolve(l)).then(function (l2) {
+          var resto = l2.filter(function (v) { return ids[v.id] && porSubir(v); });
+          var conDocs = resto.filter(tieneDocumentos), subir = resto.filter(function (v) { return !tieneDocumentos(v); });
+          var fallos = 0;
+          return subir.reduce(function (cadena, v, i) {
+            return cadena.then(function () {
+              if (parar) return;
+              var base = 'Pasando su trabajo a la dirección nueva: visita ' + (i + 1) + ' de ' + subir.length;
+              muestra(base + '…');
+              return sube(v, function (k, n) { muestra(base + ' · foto ' + k + ' de ' + n + '…'); })
+                .catch(function () { fallos++; });
+            });
+          }, Promise.resolve()).then(function () {
+            if (parar) return;
+            if (!fallos && !conDocs.length) {
+              muestra(subir.length
+                ? 'Listo. En la dirección nueva toque «Traer» en ' + (subir.length === 1 ? 'la visita' : 'cada visita') + ' para seguir donde la dejó.'
+                : 'Listo. Abriendo la dirección nueva…');
+              return espera(subir.length ? 3500 : 800).then(vete);
+            }
+            quita();
+            if (conDocs.length) notaDocumentos(conDocs.length);
+            /* si algo no subió, se reintenta al volver a abrir la app, sin aviso */
+          });
+        });
       });
-    }, 20000);
-  });
+    }).catch(function () { quita(); });
+  }
+  mudanza();
 })();
+
 </script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -368,6 +510,22 @@ textarea.inp{min-height:84px;resize:vertical;line-height:1.45}
 .previa-fotos button{min-height:38px;padding:0 14px;border-radius:8px;font-size:13.5px;
   border:1px solid var(--border,#ccc);background:transparent}
 .previa-aviso{margin:6px 0 0;font-size:11.5px;opacity:.6}
+
+/* ---------- contactos del predio (después de aceptar el tratamiento de datos) ---------- */
+.contacto{background:var(--card,transparent);border:1px solid var(--border,#ccc);border-radius:10px;padding:10px 14px;margin-top:8px}
+.contacto .c-nombre{font-weight:600;font-size:14px;overflow-wrap:anywhere}
+.contacto .c-rol{font-size:12.5px;opacity:.75;margin-top:2px;overflow-wrap:anywhere}
+.contacto .c-tels{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+.contacto .c-tels a{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 16px;border-radius:999px;
+  border:1px solid var(--primary);color:var(--primary);font-weight:600;font-size:14px;text-decoration:none;font-variant-numeric:tabular-nums}
+.contacto.sin-tel{opacity:.72}
+.contacto.sin-tel .c-sintel{font-size:12px;opacity:.8;margin-top:4px}
+.tratamiento{white-space:pre-line;font-size:13.5px;line-height:1.55;background:var(--surface-2);border-radius:10px;
+  padding:12px 14px;margin-top:8px;max-height:52vh;overflow:auto;overflow-wrap:anywhere}
+.acepto{display:flex;gap:10px;align-items:flex-start;min-height:44px;padding:12px 2px;font-size:13.5px;line-height:1.45;cursor:pointer}
+.acepto input{width:24px;height:24px;flex-shrink:0;margin:0}
+#contactos .big{margin-top:8px}
+#contactos .big:disabled{opacity:.4;cursor:default}
 .visor{position:fixed;inset:0;background:rgba(6,10,14,.94);z-index:2000;display:none;
   align-items:center;justify-content:center;padding:16px}
 .visor.abierto{display:flex;flex-direction:column}
@@ -2064,6 +2222,26 @@ window.ALMACEN = (function () {
   var CAMPOS_SIN_DANOS = { atendio_quien: 1, atendio_nombre: 1, atendio_telefono: 1,
     fecha_texto: 1, volumen_final: 1, res_cab: 1, res_aviso_enviar: 1, res_alcance: 1 };
   var NO_SIN_DANOS = "${sin_danos}!='si'";
+  // Ya reparado (29-sep): el ingeniero no podía decir «se afectó, pero ya se reparó»: ni «sin daños»
+  // era verdad ni la evaluación servía, porque clasifica un daño que ya no está. Catorce visitas lo
+  // cuentan en los comentarios y quedaron de cuatro maneras distintas. Va por el mismo registro corto,
+  // queda habitable como el sin daños y lleva la marca en sin_danos_situacion = 'reparado', con qué se
+  // reparó y quién. Lo que todavía se está reparando no entra aquí: el daño sigue, y eso se evalúa
+  // (eva_en_reparacion, en A.6).
+  E.listas.sd_situacion = [
+    { v: 'sin_danos', l: 'No se afectó con el sismo', f: '' },
+    { v: 'reparado', l: 'Se afectó y ya se reparó por completo', f: '' },
+    { v: 'en_reparacion', l: 'Se afectó y todavía se está reparando', f: '' }];
+  E.listas.sd_reparado_que = [
+    { v: 'muros', l: 'Muros', f: '' }, { v: 'panete_fachada', l: 'Pañete o fachada', f: '' },
+    { v: 'cubierta', l: 'Cubierta o techo', f: '' }, { v: 'cielo_raso', l: 'Cielo raso', f: '' },
+    { v: 'pisos', l: 'Pisos o enchapes', f: '' }, { v: 'ventanas', l: 'Ventanas, puertas o vidrios', f: '' },
+    { v: 'instalaciones', l: 'Instalaciones', f: '' }, { v: 'estructura', l: 'Columnas, vigas o placa', f: '' },
+    { v: 'otro', l: 'Otro', f: '' }];
+  E.listas.sd_reparado_quien = [
+    { v: 'propietario', l: 'El propietario', f: '' }, { v: 'arrendatario', l: 'El arrendatario', f: '' },
+    { v: 'copropiedad', l: 'La copropiedad o administración', f: '' },
+    { v: 'contratista', l: 'Un contratista o maestro de obra', f: '' }, { v: 'otro', l: 'Otro', f: '' }];
   (function expandeSinDanos() {
     function sinEl(o) { o.relevant = o.relevant ? NO_SIN_DANOS + ' and (' + o.relevant + ')' : NO_SIN_DANOS; }
     E.pasos.forEach(function (p) {
@@ -2074,18 +2252,55 @@ window.ALMACEN = (function () {
     });
     var soloSi = "${sin_danos}='si'";
     E.pasos.forEach(function (p) {
+      var reparado = soloSi + " and ${sin_danos_situacion}='reparado'";
       if (p.id === 's5_ocupantes') p.campos.unshift({ name: 'nota_sin_danos', tipo: 'nota', kind: 'vivo', relevant: soloSi,
-        texto: 'Registro sin daños | ${sin_danos_unidades} | Solo se deja constancia de que no se afectó: quién atendió, ' +
-               'una fotografía y su firma. No lleva evaluación de daños ni presupuesto. Si al revisar encuentra algún daño, ' +
-               'salga y use «Evaluar este predio».' });
-      if (p.id === 's6_fotos') p.campos.unshift({ name: 'nota_sin_danos_foto', tipo: 'nota', kind: 'ayuda', relevant: soloSi,
+        texto: 'Registro sin daños o ya reparado | ${sin_danos_unidades} | Deja constancia de que no se afectó, o de que se ' +
+               'afectó y ya quedó reparado por completo: quién atendió, una fotografía y su firma. No lleva evaluación de ' +
+               'daños ni presupuesto. Si queda algún daño sin reparar, salga y use «Evaluar este predio».' },
+        { name: 'sin_danos_situacion', label: '¿Cómo está hoy?', tipo: 'select_one', relevant: soloSi, req: true,
+          lista: 'sd_situacion', ui: 'tarjetas', valida: ". != 'en_reparacion'",
+          vmsg: 'Si todavía se está reparando, el daño sigue ahí: salga y use «Evaluar este predio».',
+          ayuda: 'Si registra varias unidades a la vez, todas quedan con esta misma respuesta.' },
+        { name: 'nota_en_reparacion', tipo: 'nota', kind: 'ayuda',
+          relevant: soloSi + " and ${sin_danos_situacion}='en_reparacion'",
+          texto: 'Esto no es un registro sin daños | Si todavía se está reparando, hay daño que clasificar. Salga con la ' +
+                 'flecha y use «Evaluar este predio»: en la clasificación (A.6) marque que hay reparaciones en curso y, en ' +
+                 'reparabilidad, mida solo lo que falta.' },
+        { name: 'reparado_que', label: '¿Qué se reparó?', tipo: 'select_multiple', relevant: reparado, req: true,
+          lista: 'sd_reparado_que', ui: 'chips' },
+        { name: 'reparado_quien', label: '¿Quién hizo la reparación?', tipo: 'select_one', relevant: reparado, req: true,
+          lista: 'sd_reparado_quien', ui: 'tarjetas' },
+        { name: 'reparado_detalle', label: 'Qué daño tuvo y cómo quedó', tipo: 'text', relevant: reparado, req: false,
+          ui: 'parrafo', ayuda: 'Opcional. Por ejemplo: «fisuras en el muro de la sala, ya resanadas y pintadas».' });
+      if (p.id === 's6_fotos') p.campos.unshift({ name: 'nota_sin_danos_foto', tipo: 'nota', kind: 'ayuda',
+        relevant: soloSi + " and ${sin_danos_situacion}!='reparado'",
         texto: 'La foto es la constancia | Una del interior o de la fachada que muestre que no hay daño. Si registra ' +
-               'varias unidades a la vez, sirve una general; puede agregar hasta cuatro.' });
+               'varias unidades a la vez, sirve una general; puede agregar hasta cuatro.' },
+        { name: 'nota_reparado_foto', tipo: 'nota', kind: 'ayuda', relevant: reparado,
+          texto: 'La foto es la constancia | Al menos una de lo que se reparó, donde se vea cómo quedó. Puede agregar ' +
+                 'hasta cuatro.' });
       // En vez de res_datos, que enseña el código de registro de la localización (aquí no se diligencia).
-      if (p.id === 'z2_resumen') p.campos.splice(3, 0, { name: 'res_sin_danos', tipo: 'nota', kind: 'vivo', relevant: soloSi,
+      if (p.id === 'z2_resumen') p.campos.splice(3, 0, { name: 'res_sin_danos', tipo: 'nota', kind: 'vivo',
+        relevant: soloSi + " and ${sin_danos_situacion}!='reparado'",
         texto: 'SIN DAÑOS | Queda registrada como habitable, sin daño y sin intervención ni presupuesto. | ' +
-               '${sin_danos_unidades} | Dirección: ${direccion} | Fecha y hora: ${fecha_texto}' });
+               '${sin_danos_unidades} | Dirección: ${direccion} | Fecha y hora: ${fecha_texto}' },
+        { name: 'res_reparado', tipo: 'nota', kind: 'vivo', relevant: reparado,
+          texto: 'YA REPARADO | Queda registrada como habitable, con la marca de que se afectó con el sismo y ya se ' +
+                 'reparó por completo. Sin evaluación ni presupuesto. | ${sin_danos_unidades} | Dirección: ${direccion} | ' +
+                 'Fecha y hora: ${fecha_texto}' });
     });
+  })();
+
+  // En reparación (29-sep): la evaluación clasifica el estado de hoy, y ahora dice también si hay obra en
+  // curso, para que una casa a medio reparar no se lea igual que una que nadie ha tocado.
+  (function reparacionEnCurso() {
+    var a6 = E.pasos.filter(function (p) { return p.id === 'a6_clasificacion'; })[0];
+    if (!a6) return;
+    var i = a6.campos.map(function (f) { return f.name; }).indexOf('eva_clasif_habitabilidad');
+    if (i < 0) return;
+    a6.campos.splice(i + 1, 0, { name: 'eva_en_reparacion', label: '¿Se están haciendo reparaciones en este momento?',
+      tipo: 'select_one', relevant: null, req: true, lista: 'si_no', ui: 'segmentado',
+      ayuda: 'La clasificación es del estado de hoy. Si hay obra en curso, en reparabilidad mida solo lo que falta por reparar.' });
   })();
 
   var idxCampo = {};
@@ -4380,6 +4595,9 @@ window.ALMACEN = (function () {
   // Lo que el servidor y el mapa leen de toda visita: habitable, sin daño, sin intervención. Se pone al
   // final y no al empezar, porque son campos de pasos que el registro sin daños esconde.
   function marcaSinDanos(v) {
+    // Ya reparado queda igual de habitable; la marca es sin_danos_situacion, que viaja en las respuestas.
+    if (!D.sin_danos_situacion) D.sin_danos_situacion = 'sin_danos';
+    if (D.sin_danos_situacion !== 'reparado') { delete D.reparado_que; delete D.reparado_quien; delete D.reparado_detalle; }
     D.eva_clasif_habitabilidad = 'habitable';
     D.eva_nivel_dano = 'ninguno_menor';
     D.eva_tipo_intervencion = 'ninguna';
@@ -4545,6 +4763,7 @@ window.ALMACEN = (function () {
 
   var API_SESION = 'https://ymbzpuxyvquvawfdntly.supabase.co/functions/v1/campo-sesion';
   var API_BORRADOR = 'https://ymbzpuxyvquvawfdntly.supabase.co/functions/v1/campo-borrador';
+  var API_CONTACTOS = 'https://ymbzpuxyvquvawfdntly.supabase.co/functions/v1/campo-contactos';
   // Con esto firma predio_tomar lo que eligio el propio ingeniero; es lo unico que distingue
   // «me equivoque al tomarlo» de «esto me lo repartieron». El servidor comprueba lo mismo.
   var MARCA_TOMADO = 'Predio elegido por el ingeniero';
@@ -6957,11 +7176,12 @@ window.ALMACEN = (function () {
            : '<button class="big" data-a="evaluar">Evaluar este predio</button>' +
              // Lo que el sismo no tocó no necesita la evaluación entera (expandeSinDanos).
              '<button class="big sec" data-a="sindanos">' +
-             (U.length > 1 || divididoEnCampo ? 'Registrar unidades sin daños' : 'Registrar sin daños') + '</button>' +
+             (U.length > 1 || divididoEnCampo ? 'Registrar unidades sin daños o ya reparadas' : 'Registrar sin daños o ya reparado') + '</button>' +
              '<p class="leyenda">' + (U.length > 1 || divididoEnCampo
-               ? 'Para los apartamentos, locales o viviendas que no se afectaron: se marcan en una lista y se registran de una vez'
-               : 'Si la edificación no se afectó') +
+               ? 'Para los apartamentos, locales o viviendas que no se afectaron o que ya se repararon: se marcan en una lista y se registran de una vez'
+               : 'Si la edificación no se afectó, o se afectó y ya se reparó por completo') +
              ' con quién atendió, una foto y su firma. Sin evaluación de daños ni presupuesto.</p>') +
+         '<div id="contactos"></div>' +
          '<div id="historial"></div>' +
          '<button class="big sec" data-a="volverpredios">Volver a la lista</button>' +
          (suyoPorEleccion && a.estado !== 'hecha' && !yaLevantoAlgo
@@ -6976,6 +7196,7 @@ window.ALMACEN = (function () {
     pintaMapaFicha(a);
     avisaBorrador(a);
     pintaHistorial(a.npn);
+    pintaContactos(a);
     window.scrollTo(0, 0);
   }
 
@@ -7012,11 +7233,12 @@ window.ALMACEN = (function () {
     var U = a.unidades || [];
     var libres = U.filter(function (u) { return !u.y; }).length;
     var h = '<div class="pantalla">' + barraRed() +
-      '<div class="eyebrow">Registro sin daños</div>' +
+      '<div class="eyebrow">Registro sin daños o ya reparado</div>' +
       '<h1>' + esc(sinUnidad(a.direccion) || ('Predio ' + String(a.npn).slice(-8))) + '</h1>' +
-      '<p class="lede">Marque las unidades que <b>no se afectaron</b>. Se registran juntas con quién atendió, una foto' +
-      ' y su firma, sin evaluación de daños ni presupuesto; cada una queda como su propia visita. Las que tengan' +
-      ' algún daño levántelas aparte con «Evaluar este predio».</p>' +
+      '<p class="lede">Marque las unidades que <b>no se afectaron</b> o que <b>ya quedaron reparadas</b>. Se registran' +
+      ' juntas con quién atendió, una foto y su firma, sin evaluación de daños ni presupuesto; cada una queda como su' +
+      ' propia visita. Todas las que marque quedan con la misma respuesta: si unas se repararon y otras no se' +
+      ' afectaron, regístrelas en dos tandas. Las que tengan algún daño sin reparar, levántelas con «Evaluar este predio».</p>' +
       '<div class="seccion"><h2>Unidades</h2><span class="cuenta">' + libres + ' por levantar</span></div>' +
       (libres > 1 ? '<div class="sd-todas"><button type="button" class="big sec" data-a="sdtodas" data-v="1">Marcar todas</button>' +
         '<button type="button" class="big sec" data-a="sdtodas" data-v="0">Quitar todas</button></div>' : '') +
@@ -8829,6 +9051,9 @@ window.ALMACEN = (function () {
 
     if (a === 'predio') { e.preventDefault(); return fichaPredio(b.dataset.id); }
     if (a === 'volverpredios') return pintaPredios();
+    if (a === 'vercontactos') return cargaContactos();
+    if (a === 'aceptadatos') return aceptaTratamiento();
+    if (a === 'noaceptadatos' || a === 'ocultacontactos') return cierraContactos();
     if (a === 'buscar') { BUSCA.filas = null; BUSCA.aviso = ''; return pintaBuscador(); }
     if (a === 'buscatexto') return lanzaBusquedaTexto();
     if (a === 'buscagps') return buscaCerca();
@@ -9137,6 +9362,198 @@ window.ALMACEN = (function () {
       return;
     }
   });
+
+  // ================================================================ contactos del predio
+  // Con quién hablar para coordinar la visita: la administración o quien atendió visitas anteriores, quien la pidió,
+  // y los propietarios y arrendatarios por apartamento (RUD, catastro y el censo de la Alcaldía). Los da la función
+  // campo-contactos, que solo responde si el predio está en la lista del ingeniero y si aceptó el tratamiento de datos
+  // (Ley 1581): la primera vez sale el texto y hay que marcar «Acepto». La regla está en el servidor, no aquí.
+  //
+  // No se guardan en el teléfono —ni IndexedDB ni localStorage—: viven en memoria mientras la app está abierta. Es
+  // lo que el texto le pide al ingeniero («no los guarde en su teléfono»), y un teléfono de campo se presta y se pierde.
+  // Cada consulta queda registrada en el servidor con quién, qué predio y cuándo.
+
+  var CONTACTOS = {};       // id22 -> lo que devolvió el servidor (solo en memoria)
+  var TRATAMIENTO = null;   // el texto vigente, cuando el servidor pide aceptarlo antes de dar los contactos
+
+  function pideContactos(cuerpo) {
+    return fetch(API_CONTACTOS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-token-evaluador': token() },
+      body: JSON.stringify(cuerpo)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { j._estado = r.status; return j; });
+    });
+  }
+
+  function cajaContactos() { return document.getElementById('contactos'); }
+
+  function tituloContactos(n) {
+    return '<div class="seccion"><h2>Contactos del predio</h2>' +
+           (n != null ? '<span class="cuenta">' + n + '</span>' : '') + '</div>';
+  }
+
+  function pintaContactos(a) {
+    var caja = cajaContactos();
+    if (!caja) return;
+    var id22 = String(a.npn || '').replace(/\D/g, '').slice(0, 22);
+    caja.dataset.id22 = id22;
+    if (CONTACTOS[id22]) return muestraContactos(id22);
+    caja.innerHTML = tituloContactos() +
+      '<p class="leyenda">Con quién hablar para coordinar la visita: la administración, quien atendió visitas ' +
+      'anteriores, quien la pidió y los propietarios y arrendatarios por apartamento.</p>' +
+      '<button class="big sec" data-a="vercontactos">Ver contactos</button>';
+  }
+
+  function avisoContactos(texto, reintentar) {
+    var caja = cajaContactos();
+    if (!caja) return;
+    caja.innerHTML = tituloContactos() + '<div class="nota r">' + esc(texto) + '</div>' +
+      (reintentar ? '<button class="big sec" data-a="vercontactos">Intentar de nuevo</button>' : '');
+  }
+
+  function cargaContactos() {
+    var caja = cajaContactos();
+    if (!caja) return;
+    var id22 = caja.dataset.id22;
+    if (navigator.onLine === false || !token()) {
+      return avisoContactos('Los contactos necesitan conexión. Ábralos cuando tenga señal.', true);
+    }
+    caja.innerHTML = tituloContactos() + '<div class="cargando">Buscando contactos…</div>';
+    pideContactos({ accion: 'ver', id22: id22 }).then(function (j) {
+      if (cajaContactos() !== caja) return;              // ya se fue a otra pantalla
+      if (j._estado === 428) { TRATAMIENTO = j; return pintaTratamiento(); }
+      if (j._estado !== 200) return avisoContactos(j.error || 'No se pudieron consultar los contactos.', j._estado >= 500);
+      CONTACTOS[id22] = j;
+      muestraContactos(id22);
+    }).catch(function () {
+      avisoContactos('No se pudieron consultar los contactos. Revise la señal e inténtelo de nuevo.', true);
+    });
+  }
+
+  function pintaTratamiento() {
+    var caja = cajaContactos();
+    if (!caja) return;
+    var t = TRATAMIENTO || {};
+    caja.innerHTML = '<div class="seccion"><h2>' + esc(t.titulo || 'Tratamiento de datos personales') + '</h2></div>' +
+      '<p class="leyenda">Antes de ver los contactos lea esto y acéptelo. Se pide una sola vez.</p>' +
+      '<div class="tratamiento">' + esc(t.texto || '') + '</div>' +
+      '<label class="acepto"><input type="checkbox" id="aceptoDatos">' +
+      '<span>Leí y acepto el tratamiento de datos personales, y me comprometo a usarlos solo para ' +
+      'coordinar esta visita.</span></label>' +
+      '<button class="big" data-a="aceptadatos" id="btnAceptoDatos" disabled>Aceptar y ver contactos</button>' +
+      '<button class="big sec" data-a="noaceptadatos">Ahora no</button>';
+    var chk = document.getElementById('aceptoDatos');
+    chk.addEventListener('change', function () {
+      document.getElementById('btnAceptoDatos').disabled = !chk.checked;
+    });
+  }
+
+  function aceptaTratamiento() {
+    var chk = document.getElementById('aceptoDatos'), btn = document.getElementById('btnAceptoDatos');
+    if (!chk || !chk.checked || !TRATAMIENTO) return;
+    btn.disabled = true; btn.textContent = 'Guardando…';
+    pideContactos({ accion: 'acepta', version: TRATAMIENTO.version }).then(function (j) {
+      if (j._estado === 409) { TRATAMIENTO = j; return pintaTratamiento(); }   // el texto cambió mientras lo leía
+      if (j._estado !== 200) {
+        btn.disabled = false; btn.textContent = 'Aceptar y ver contactos';
+        return alert(j.error || 'No se pudo registrar la aceptación. Inténtelo de nuevo.');
+      }
+      TRATAMIENTO = null;
+      cargaContactos();
+    }).catch(function () {
+      btn.disabled = false; btn.textContent = 'Aceptar y ver contactos';
+      alert('No se pudo registrar la aceptación. Revise la señal e inténtelo de nuevo.');
+    });
+  }
+
+  function cierraContactos() {
+    var caja = cajaContactos();
+    if (!caja) return;
+    delete CONTACTOS[caja.dataset.id22];
+    TRATAMIENTO = null;
+    pintaContactos({ npn: caja.dataset.id22 });
+  }
+
+  function telLegible(t) {
+    t = String(t);
+    if (t.length === 10) return t.slice(0, 3) + ' ' + t.slice(3, 6) + ' ' + t.slice(6);
+    if (t.length === 7) return t.slice(0, 3) + ' ' + t.slice(3);
+    return t;
+  }
+  // Un fijo viejo de 7 dígitos es de Manizales: se marca con el indicativo 606.
+  function telEnlace(t) { t = String(t); return 'tel:+57' + (t.length === 7 ? '606' + t : t); }
+
+  // «K 23 66 64 Ap 102» y «CARRERA 23 #66-64 APT 102» -> «Ap 102»: el catastro y el RUD escriben la misma unidad
+  // de formas distintas, y sin unificarlas la persona salía con «Ap 102 · APT 102». Sin unidad, null.
+  var TIPO_UNIDAD = { ap: 'Ap', apto: 'Ap', apt: 'Ap', apartamento: 'Ap', pq: 'Pq', parq: 'Pq', parqueadero: 'Pq',
+    lc: 'Local', local: 'Local', of: 'Of', oficina: 'Of', dp: 'Dp', bq: 'Bloque', bl: 'Bloque', bloque: 'Bloque',
+    to: 'Torre', torre: 'Torre', casa: 'Casa', int: 'Int', interior: 'Int' };
+  function unidadCorta(u) {
+    // (?=\b|\d): también «AP102», pegado
+    var m = /\b(apartamento|apto|apt|ap|parqueadero|parq|pq|local|lc|oficina|of|dp|bloque|bq|bl|torre|to|casa|interior|int)(?=\b|\d)\.?\s*(.*)$/i
+      .exec(String(u || ''));
+    return m ? (TIPO_UNIDAD[m[1].toLowerCase()] + ' ' + m[2].replace(/\s+/g, ' ')).trim() : null;
+  }
+  function unidadesDe(p) {
+    var cortas = [], enteras = [], vistas = {};
+    (p.unidades || []).forEach(function (u) {
+      var c = unidadCorta(u), lista = c === null ? enteras : cortas, texto = c === null ? String(u) : c;
+      var llave = (c === null ? 'e:' : 'c:') + texto.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (!vistas[llave]) { vistas[llave] = 1; lista.push(texto); }
+    });
+    return cortas.length ? cortas : enteras;
+  }
+
+  function fechaContacto(f) {
+    if (!f) return '';
+    try { return new Date(f + 'T12:00:00').toLocaleDateString('es-CO', { day: 'numeric', month: 'short' }); }
+    catch (e) { return ''; }
+  }
+
+  function tarjetaContacto(nombre, detalle, tels) {
+    var con = tels && tels.length;
+    return '<div class="contacto' + (con ? '' : ' sin-tel') + '">' +
+      '<div class="c-nombre">' + esc(nombre || 'Sin nombre') + '</div>' +
+      (detalle ? '<div class="c-rol">' + esc(detalle) + '</div>' : '') +
+      (con ? '<div class="c-tels">' + tels.map(function (t) {
+               return '<a href="' + esc(telEnlace(t)) + '">' + esc(telLegible(t)) + '</a>';
+             }).join('') + '</div>'
+           : '<div class="c-sintel">Sin teléfono registrado</div>') +
+      '</div>';
+  }
+
+  function muestraContactos(id22) {
+    var caja = cajaContactos(), d = CONTACTOS[id22];
+    if (!caja || !d) return;
+    var C = d.coordinar || [], P = d.personas || [];
+    var h = tituloContactos(C.length + P.length) +
+      '<div class="nota a">Datos personales: úselos solo para coordinar esta visita. No los copie, no les haga ' +
+      'capturas y no los comparta.</div>';
+    if (!C.length && !P.length) {
+      h += '<div class="nota">No hay contactos registrados para este predio.</div>';
+    }
+    if (C.length) {
+      h += '<div class="seccion"><h2>Para coordinar</h2></div>';
+      C.forEach(function (c) {
+        var f = fechaContacto(c.fecha);
+        h += tarjetaContacto(c.nombre, (c.rol || '') + (f ? ' · ' + f : ''), c.telefonos);
+      });
+    }
+    if (P.length) {
+      h += '<div class="seccion"><h2>Por apartamento o unidad</h2></div>';
+      P.forEach(function (p) {
+        var partes = [];
+        if (p.roles && p.roles.length) partes.push(p.roles.join(' y '));
+        var u = unidadesDe(p);
+        if (u.length) partes.push(u.join(' · '));
+        if ((p.fuentes || []).indexOf('RUD') >= 0) partes.push('inscrito en el RUD');
+        h += tarjetaContacto(p.nombre, partes.join(' · '), p.telefonos);
+      });
+    }
+    h += '<button class="big sec" data-a="ocultacontactos">Ocultar contactos</button>';
+    caja.innerHTML = h;
+  }
 
   // ================================================================ historial del predio
   // Lo que ya se sabe antes de ir: las visitas anteriores de la Alcaldía con sus
