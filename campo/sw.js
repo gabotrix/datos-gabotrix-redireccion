@@ -6,7 +6,7 @@
    Se sirve junto a visita.html desde un servidor propio (https o localhost).
    Al publicar una versión nueva, subir CACHE para que se reemplace la vieja. */
 
-var CACHE = 'psismo-v78-dominio-viejo-2';
+var CACHE = 'psismo-v81-dominio-viejo';
 // informe.js va aquí y no solo en la red: el informe del predio se arma al cerrar la visita,
 // que es cuando menos señal hay. addAll es todo o nada, así que o entran los dos o se queda
 // la versión anterior completa.

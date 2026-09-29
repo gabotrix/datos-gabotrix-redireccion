@@ -6,9 +6,10 @@ Todo el dominio viejo reenvía al nuevo con ruta, parámetros y ancla (index.htm
 La excepción es el formulario de campo (/campo/): el teléfono guarda las visitas sin enviar en el almacenamiento del
 dominio donde se abrió la app, y el dominio nuevo no las ve. Por eso /campo/ en el dominio viejo es una copia del
 formulario vigente con un guardián al inicio:
-  · si el teléfono no tiene visitas sin enviar (estado distinto de «enviada»), se va al dominio nuevo de inmediato;
-  · si las tiene, la app abre aquí con un aviso, el ingeniero las envía como siempre y, cuando no queda ninguna,
-    pasa sola al dominio nuevo.
+  · si el teléfono no tiene visitas pendientes (terminadas o pasadas del primer paso), se va al dominio nuevo de inmediato;
+  · si las tiene, deja a la app enviar las terminadas, sube el resto como borrador (respuestas y fotos) a
+    campo-borrador y se va: en el dominio nuevo cada visita vuelve con «Traer». Sin señal se queda aquí sin aviso.
+    Solo una visita con documentos PDF se envía desde aquí (guardian.js, v2 del 29-sep-2026).
 La copia usa los mismos servicios (Supabase) y lee el mapa del dominio nuevo. El service worker se renombra para que
 reemplace cualquier página de error que el teléfono haya guardado mientras el dominio viejo respondía 404.
 
@@ -20,79 +21,8 @@ NUEVO = "https://manizalesconstruye.camacolcaldas.com"
 if os.path.exists(DST): shutil.rmtree(DST)
 shutil.copytree(SRC, DST)
 
-GUARDIAN = r"""<script>
-/* Guardián del dominio viejo: solo se queda aquí quien tenga visitas sin enviar en este teléfono. */
-(function () {
-  var NUEVO = '__NUEVO__';
-  var destino = NUEVO + location.pathname + location.search + location.hash;
-  window.__DOMINIO_VIEJO__ = true;
-  function sinEnviar(lista) { return lista.filter(function (v) { return v && v.estado && v.estado !== 'enviada'; }).length; }
-  function desdeRespaldo() { try { var t = JSON.parse(localStorage.getItem('psismo.visitas') || '{}'); return sinEnviar(Object.keys(t).map(function (k) { return t[k]; })); } catch (e) { return 0; } }
-  /* Devuelve cuántas visitas sin enviar hay; -1 si no se pudo saber (entonces la app se queda aquí, por prudencia).
-     No se abre la base si no existe: abrirla la crearía vacía y la app arrancaría sin sus almacenes. */
-  function existeBase() {
-    if (!indexedDB.databases) return Promise.resolve(null);   /* navegador sin la lista: no se sabe */
-    return indexedDB.databases().then(function (l) { return l.some(function (x) { return x.name === 'psismo'; }); }).catch(function () { return null; });
-  }
-  function cuenta() {
-    var n0 = desdeRespaldo();
-    if (!window.indexedDB) return Promise.resolve(n0);
-    return existeBase().then(function (hay) {
-      if (hay === false) return n0;
-      if (hay === null) return n0 > 0 ? n0 : -1;
-      return new Promise(function (ok) {
-        var listo = false, reloj = setTimeout(function () { if (!listo) { listo = true; ok(n0 || -1); } }, 8000), s;
-        try { s = indexedDB.open('psismo'); } catch (e) { clearTimeout(reloj); return ok(n0 || -1); }
-        s.onerror = function () { if (!listo) { listo = true; clearTimeout(reloj); ok(n0 || -1); } };
-        s.onsuccess = function () {
-          var d = s.result;
-          var fin = function (n) { if (listo) return; listo = true; clearTimeout(reloj); try { d.close(); } catch (e) {} ok(n < 0 ? -1 : n + n0); };
-          if (!d.objectStoreNames.contains('visitas')) return fin(0);
-          try {
-            var r = d.transaction('visitas', 'readonly').objectStore('visitas').getAll();
-            r.onsuccess = function () { fin(sinEnviar(r.result || [])); };
-            r.onerror = function () { fin(-1); };
-          } catch (e) { fin(-1); }
-        };
-      });
-    });
-  }
-  /* El aviso tapa la parte de arriba de la pantalla (el visor de fotos, por ejemplo): la X lo cierra hasta que se
-     vuelva a abrir la app. El guardián sigue trabajando por debajo y pasa al dominio nuevo cuando no quede nada. */
-  var CERRADO = 'psismo.avisoDominioCerrado';
-  function cerrado() { try { return sessionStorage.getItem(CERRADO) === '1'; } catch (e) { return false; } }
-  function aviso(n) {
-    if (cerrado()) return;
-    var b = document.createElement('div');
-    b.id = 'avisoDominio';
-    b.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:99999;background:#fac400;color:#0f2447;font:600 13px/1.4 system-ui,sans-serif;padding:10px 48px 10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.2)');
-    var x = document.createElement('button');
-    x.type = 'button';
-    x.setAttribute('aria-label', 'Cerrar aviso');
-    x.textContent = '×';
-    x.setAttribute('style', 'position:absolute;top:50%;right:6px;transform:translateY(-50%);width:36px;height:36px;border:0;border-radius:50%;background:rgba(15,36,71,.12);color:#0f2447;font:700 22px/36px system-ui,sans-serif;padding:0;cursor:pointer');
-    x.addEventListener('click', function () { try { sessionStorage.setItem(CERRADO, '1'); } catch (e) {} b.remove(); });
-    var t = document.createElement('div');
-    t.innerHTML = n > 0
-      ? 'La app cambió de dirección. Este teléfono tiene ' + n + ' visita' + (n === 1 ? '' : 's') + ' sin enviar: envíela' + (n === 1 ? '' : 's') + ' desde aquí. Cuando no quede ninguna, pasará sola a la dirección nueva.'
-      : 'La app cambió de dirección. No se pudo revisar si hay visitas sin enviar: envíe lo pendiente y luego <a style="color:#0f2447" href="' + destino + '">abra la dirección nueva</a>.';
-    b.appendChild(t); b.appendChild(x);
-    (document.body || document.documentElement).appendChild(b);
-  }
-  cuenta().then(function (n) {
-    if (n === 0) { location.replace(destino); return; }
-    var pinta = function () { if (!document.getElementById('avisoDominio')) aviso(n); };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', pinta); else pinta();
-    /* cada 20 s: si ya se envió todo, pasar al dominio nuevo */
-    setInterval(function () {
-      cuenta().then(function (m) {
-        if (m === 0) { location.replace(NUEVO + location.pathname + location.search + location.hash); return; }
-        var a = document.getElementById('avisoDominio'); if (a) a.remove(); aviso(m);
-      });
-    }, 20000);
-  });
-})();
-</script>""".replace("__NUEVO__", NUEVO)
+# El guardián vive en guardian.js (v2, 29-sep-2026: sube lo pendiente como borrador y se va; ver su cabecera).
+GUARDIAN = "<script>\n" + io.open(os.path.join(HERE, "guardian.js"), encoding="utf-8").read().replace("__NUEVO__", NUEVO) + "\n</script>"
 
 p = os.path.join(DST, "visita.html"); s = io.open(p, encoding="utf-8").read()
 s, k = re.subn(r"var MAPA_DATA = '\.\./mapa/data/'", f"var MAPA_DATA = '{NUEVO}/mapa/data/'", s); assert k == 1, "MAPA_DATA no encontrado"

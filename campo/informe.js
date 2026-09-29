@@ -1044,7 +1044,18 @@ window.INFORME = (function () {
     // Registro sin daños (desde el 25-sep): solo deja constancia de que no se afectó. El documento no
     // puede leerse como una evaluación a medias —«Sin clasificar», «no dejó cantidades»—: dice lo que es.
     var sinDanos = D.sin_danos === 'si';
-    var titulo = sinDanos ? 'Registro de visita · Sin daños por el sismo'
+    // Ya reparado (29-sep): el mismo registro corto, pero la edificación sí se afectó. El documento no
+    // puede decir «no se afectó». Las listas van aquí porque el panel no las trae en su esquema.
+    var reparado = sinDanos && D.sin_danos_situacion === 'reparado';
+    var R_QUE = { muros: 'Muros', panete_fachada: 'Pañete o fachada', cubierta: 'Cubierta o techo', cielo_raso: 'Cielo raso',
+      pisos: 'Pisos o enchapes', ventanas: 'Ventanas, puertas o vidrios', instalaciones: 'Instalaciones',
+      estructura: 'Columnas, vigas o placa', otro: 'Otro' };
+    var R_QUIEN = { propietario: 'El propietario', arrendatario: 'El arrendatario', copropiedad: 'La copropiedad o administración',
+      contratista: 'Un contratista o maestro de obra', otro: 'Otro' };
+    var queRep = (Array.isArray(D.reparado_que) ? D.reparado_que : String(D.reparado_que || '').split(/[\s,]+/))
+      .filter(Boolean).map(function (x) { return R_QUE[x] || x; }).join(', ');
+    var titulo = reparado ? 'Registro de visita · Daños ya reparados'
+      : sinDanos ? 'Registro de visita · Sin daños por el sismo'
       : 'Informe de evaluación de daños y recursos de recuperación' + (comunes ? ' · Zonas comunes del edificio' : '');
     // En un edificio, el predio y la ficha evaluada son dos números distintos: unit_Code es el del
     // predio matriz (termina en 00000000) y la ficha es unidad_npn, con su rótulo («Piso 3 · Unidad
@@ -1060,7 +1071,19 @@ window.INFORME = (function () {
     function H(t) { return '<h2><i>' + (++nSec) + '</i>' + esc(t) + '</h2>'; }
 
     // dictamen y cifras gruesas
-    if (sinDanos) B('<div class="dictamen">' +
+    if (reparado) B('<div class="dictamen">' +
+        '<div class="sello am"><span>Resultado de la visita</span><b style="color:#1F7A44">Ya reparado</b></div>' +
+        '<div class="sello"><span>Habitabilidad</span><b>Habitable (Verde)</b></div>' +
+        '<div class="sello"><span>Intervención</span><b>No requiere</b></div></div>' +
+      '<p class="nota">Se registró que ' + (ficha ? 'la unidad' : 'la edificación') + ' se afectó con el sismo y ya se ' +
+        'reparó por completo: no lleva evaluación de daños, reparabilidad ni presupuesto. La constancia son la ' +
+        'fotografía de lo reparado y la firma.</p>' +
+      rej([['Qué se reparó', queRep || '—', 'w2'], ['Quién hizo la reparación', R_QUIEN[D.reparado_quien] || D.reparado_quien || '—'],
+           ['Qué daño tuvo y cómo quedó', D.reparado_detalle || '—', 'w3']]) +
+      (D.sin_danos_grupo && D.sin_danos_unidades
+        ? '<p class="nota">Se registró en un mismo recorrido junto con otras unidades del edificio (' +
+          esc(D.sin_danos_unidades) + '); cada una tiene su propia visita.</p>' : ''));
+    else if (sinDanos) B('<div class="dictamen">' +
         '<div class="sello am"><span>Resultado de la visita</span><b style="color:#1F7A44">Sin daños</b></div>' +
         '<div class="sello"><span>Habitabilidad</span><b>Habitable (Verde)</b></div>' +
         '<div class="sello"><span>Intervención</span><b>No requiere</b></div></div>' +
