@@ -18,7 +18,16 @@
      5. Una visita con documentos (PDF) no cabe en un borrador: esa se envía desde aquí, y solo entonces sale una nota.
 
    Nada se borra de este teléfono: lo subido queda anotado (psismo.migradoAlNuevo, con la hora de su último cambio)
-   para no volver a subirlo, y si la visita cambiara después se subiría otra vez. */
+   para no volver a subirlo, y si la visita cambiara después se subiría otra vez.
+
+   v3 (29-sep-2026): el iPhone de un ingeniero, con 253 MB de visitas guardadas, mostraba «Ocurrió un problema varias
+   veces» y no abría. La v2 leía TODAS las visitas de una vez (getAll, fotos incluidas) mientras la app hacía lo
+   mismo, y las volvía a leer cada 4 s esperando las terminadas: dos o tres copias de todo en memoria, y Safari cierra
+   la página. Ahora se recorren de una en una y solo se guarda lo ligero (id, estado, paso); cada visita se lee
+   entera en el momento de subirla y se suelta después.
+   Y si el teléfono no alcanza a leer sus visitas (una lectura que no termina), la v2 lo tomaba por «no hay nada» y
+   se iba al dominio nuevo, dejando el trabajo atrás sin forma de volver a él. Ahora no leer no es «no hay nada»: se
+   queda aquí, sin aviso, como sin señal. */
 (function () {
   var NUEVO = 'https://manizalesconstruye.camacolcaldas.com';
   var API = 'https://ymbzpuxyvquvawfdntly.supabase.co/functions/v1/campo-borrador';
@@ -57,36 +66,87 @@
   function pendiente(v) { return !!(v && v.id && v.estado !== 'enviada' && (v.estado === 'lista' || (v.paso || 0) > 0)); }
   function porSubir(v) { return pendiente(v) && migrado()[v.id] !== (v.tocada || 0); }
 
-  /* Las visitas de este teléfono: IndexedDB (con fotos) y el respaldo de localStorage (sin fotos), sin crear la base
-     si no existe. Si la base no abre, la app también trabaja con el respaldo, así que eso es lo que hay. */
-  function leeIDB() {
+  /* La base del teléfono, sin crearla si no existe: { d } abierta, { vacia } si no hay nada, o null si no se pudo
+     abrir (bloqueada, rota o sin permiso). */
+  function abreBase() {
     return new Promise(function (ok) {
-      if (!window.indexedDB) return ok([]);
+      if (!window.indexedDB) return ok({ vacia: true });
       var listo = false, s, nueva = false;
       var reloj = setTimeout(function () { fin(null); }, 8000);
-      function fin(l) { if (listo) return; listo = true; clearTimeout(reloj); ok(l); }
+      function fin(r) {
+        if (listo) { if (r && r.d) try { r.d.close(); } catch (e) {} return; }
+        listo = true; clearTimeout(reloj); ok(r);
+      }
       try { s = indexedDB.open('psismo'); } catch (e) { return fin(null); }
       s.onupgradeneeded = function (ev) { if (ev.oldVersion === 0) { nueva = true; try { s.transaction.abort(); } catch (e) {} } };
-      s.onerror = function (ev) { try { ev.preventDefault(); } catch (e) {} fin(nueva ? [] : null); };
+      s.onerror = function (ev) { try { ev.preventDefault(); } catch (e) {} fin(nueva ? { vacia: true } : null); };
       s.onblocked = function () { fin(null); };
       s.onsuccess = function () {
         var d = s.result;
         /* Que la app pueda abrir o actualizar la base aunque esta lectura siga en curso. */
         d.onversionchange = function () { try { d.close(); } catch (e) {} };
-        if (!d.objectStoreNames.contains('visitas')) { try { d.close(); } catch (e) {} return fin([]); }
-        try {
-          var r = d.transaction('visitas', 'readonly').objectStore('visitas').getAll();
-          r.onsuccess = function () { try { d.close(); } catch (e) {} fin(r.result || []); };
-          r.onerror = function () { try { d.close(); } catch (e) {} fin(null); };
-        } catch (e) { try { d.close(); } catch (x) {} fin(null); }
+        if (!d.objectStoreNames.contains('visitas')) { try { d.close(); } catch (e) {} return fin({ vacia: true }); }
+        fin({ d: d });
       };
     });
   }
+  /* Lo que hace falta para decidir, sin las fotos: es lo único que se guarda de cada visita mientras se recorren. */
+  function ligera(v) {
+    return { id: v.id, estado: v.estado, paso: v.paso || 0, tocada: v.tocada || 0, docs: tieneDocumentos(v) };
+  }
+  /* Las visitas de IndexedDB de una en una (cursor), quedándose solo con lo ligero. El reloj se reinicia con cada
+     visita leída: un teléfono con cientos de megas tarda, pero avanza; lo que no avanza en 15 s es que no se puede. */
+  function leeLigero() {
+    return abreBase().then(function (b) {
+      if (!b) return null;
+      if (b.vacia) return [];
+      return new Promise(function (ok) {
+        var l = [], listo = false, reloj = null;
+        function fin(x) { if (listo) return; listo = true; clearTimeout(reloj); try { b.d.close(); } catch (e) {} ok(x); }
+        function arma() { clearTimeout(reloj); reloj = setTimeout(function () { fin(null); }, 15000); }
+        arma();
+        try {
+          var c = b.d.transaction('visitas', 'readonly').objectStore('visitas').openCursor();
+          c.onsuccess = function () {
+            var k = c.result;
+            if (!k) return fin(l);
+            if (k.value && k.value.id) l.push(ligera(k.value));
+            arma(); k.continue();
+          };
+          c.onerror = function (ev) { try { ev.preventDefault(); } catch (e) {} fin(null); };
+        } catch (e) { fin(null); }
+      });
+    });
+  }
+  /* Una visita entera (con sus fotos), solo cuando toca subirla. Sin IndexedDB, la del respaldo. */
+  function leeUna(id) {
+    return abreBase().then(function (b) {
+      if (!b || b.vacia) return null;
+      return new Promise(function (ok) {
+        var listo = false, reloj = setTimeout(function () { fin(null); }, 30000);
+        function fin(x) { if (listo) return; listo = true; clearTimeout(reloj); try { b.d.close(); } catch (e) {} ok(x); }
+        try {
+          var r = b.d.transaction('visitas', 'readonly').objectStore('visitas').get(id);
+          r.onsuccess = function () { fin(r.result || null); };
+          r.onerror = function (ev) { try { ev.preventDefault(); } catch (e) {} fin(null); };
+        } catch (e) { fin(null); }
+      });
+    }).then(function (v) { return v || respaldo()[id] || null; });
+  }
+  /* El respaldo de localStorage: las respuestas sin las fotos. Es lo que usa la app cuando IndexedDB no abre. */
+  function respaldo() {
+    var t = leeJSON('psismo.visitas') || {}, porId = {};
+    Object.keys(t).forEach(function (k) { if (t[k] && t[k].id) porId[t[k].id] = t[k]; });
+    return porId;
+  }
+  /* Las visitas de este teléfono en ligero: las de IndexedDB y, además, las que solo estén en el respaldo. null si
+     IndexedDB existe y no se pudo leer: eso NO es «no hay nada», y quien llama se queda aquí. */
   function visitas() {
-    return leeIDB().then(function (idb) {
-      var t = leeJSON('psismo.visitas') || {}, porId = {};
-      Object.keys(t).forEach(function (k) { if (t[k] && t[k].id) porId[t[k].id] = t[k]; });
-      (idb || []).forEach(function (v) { if (v && v.id) porId[v.id] = v; });   /* la de IndexedDB lleva las fotos */
+    return leeLigero().then(function (idb) {
+      if (idb === null) return null;
+      var porId = {}, R = respaldo();
+      Object.keys(R).forEach(function (k) { porId[k] = ligera(R[k]); });
+      idb.forEach(function (v) { porId[v.id] = v; });   /* la de IndexedDB manda: es la que lleva las fotos */
       return Object.keys(porId).map(function (k) { return porId[k]; });
     });
   }
@@ -114,22 +174,26 @@
     });
     return l;
   }
-  /* Una visita al servidor: las respuestas y después cada foto. Si algo falla, no se da por subida. */
-  function sube(v, avance) {
-    var R = {};
-    Object.keys(v.D || {}).forEach(function (k) { if (k !== 'clave_dispositivo' && !esAdjunto(v.D[k])) R[k] = v.D[k]; });
-    var fotos = fotosDe(v);
-    return pide({ accion: 'guarda', visita: v.id, asignacion: v.asignacion || null, respuestas: R,
-                  paso: v.paso || 0, resumen: titulo(v), dispositivo: ('dominio viejo · ' + (navigator.userAgent || '')).slice(0, 80) })
-      .then(function () {
-        return fotos.reduce(function (cadena, f, i) {
-          return cadena.then(function () {
-            avance(i + 1, fotos.length);
-            return pide({ accion: 'foto', visita: v.id, campo: f.campo, orden: f.orden, datos: f.datos });
-          });
-        }, Promise.resolve());
-      })
-      .then(function () { anotaMigrado(v); return true; });
+  /* Una visita al servidor: las respuestas y después cada foto. Si algo falla, no se da por subida. Se lee entera
+     aquí, de la base, y al terminar se suelta: en memoria nunca hay más de una visita con sus fotos. */
+  function sube(ligeraV, avance) {
+    return leeUna(ligeraV.id).then(function (v) {
+      if (!v) throw new Error('no se pudo leer ' + ligeraV.id);
+      var R = {};
+      Object.keys(v.D || {}).forEach(function (k) { if (k !== 'clave_dispositivo' && !esAdjunto(v.D[k])) R[k] = v.D[k]; });
+      var fotos = fotosDe(v);
+      return pide({ accion: 'guarda', visita: v.id, asignacion: v.asignacion || null, respuestas: R,
+                    paso: v.paso || 0, resumen: titulo(v), dispositivo: ('dominio viejo · ' + (navigator.userAgent || '')).slice(0, 80) })
+        .then(function () {
+          return fotos.reduce(function (cadena, f, i) {
+            return cadena.then(function () {
+              avance(i + 1, fotos.length);
+              return pide({ accion: 'foto', visita: v.id, campo: f.campo, orden: f.orden, datos: f.datos });
+            });
+          }, Promise.resolve());
+        })
+        .then(function () { anotaMigrado(v); return true; });
+    });
   }
 
   /* ---- lo que se ve: una capa mientras se sube, y la nota de los documentos */
@@ -167,6 +231,7 @@
   /* Las terminadas las envía la app sola al arrancar con señal: se le da tiempo antes de subir nada. */
   function esperaListas(ids, desde) {
     return visitas().then(function (l) {
+      if (l === null) throw new Error('no se pudieron leer las visitas');
       var quedan = l.filter(function (v) { return ids[v.id] && v.estado === 'lista'; }).length;
       if (!quedan || parar || Date.now() - desde > ESPERA_LISTAS) return l;
       muestra('Enviando ' + (quedan === 1 ? 'la visita terminada' : 'las ' + quedan + ' visitas terminadas') + '…');
@@ -176,6 +241,8 @@
 
   function mudanza() {
     return visitas().then(function (l) {
+      /* sin poder leerlas no se sabe si hay trabajo aquí: se queda, sin aviso, y se reintenta al volver a abrir */
+      if (l === null) return;
       var p = l.filter(porSubir);
       if (!p.length) return vete();
       if (!token() || navigator.onLine === false) return;        /* sin señal: se trabaja aquí, sin aviso */
@@ -185,7 +252,7 @@
         muestra('Revisando las visitas de este teléfono…');
         return (hayListas ? esperaListas(ids, Date.now()) : Promise.resolve(l)).then(function (l2) {
           var resto = l2.filter(function (v) { return ids[v.id] && porSubir(v); });
-          var conDocs = resto.filter(tieneDocumentos), subir = resto.filter(function (v) { return !tieneDocumentos(v); });
+          var conDocs = resto.filter(function (v) { return v.docs; }), subir = resto.filter(function (v) { return !v.docs; });
           var fallos = 0;
           return subir.reduce(function (cadena, v, i) {
             return cadena.then(function () {
